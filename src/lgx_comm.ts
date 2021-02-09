@@ -1,11 +1,15 @@
 import { Socket, isIPv4 } from "net";
-import { pathToFileURL } from "url";
 import { PLC } from "./eip";
 import { randrange } from "./utils/helperFunctions";
 const struct = require("python-struct");
 
+interface Route {
+  path: number;
+  slot: number | string;
+}
+
 class Connection {
-  private parent;
+  private parent: PLC;
   private port = 44818;
   private VendorID = 0x1337;
   private Context = 0x00;
@@ -266,19 +270,47 @@ class Connection {
     // Build the connected path partition? of the packet
     //if a route was provided, use it, otherwise use
     // the default route
-    let route;
+    let route: Array<Route> | null;
     if (this.parent.Route) {
       route = this.parent.Route;
     } else {
       if (this.parent.Micro800) {
         route = [];
       } else {
-        route = [{ path: 0x01, slot: this.parent.ProcessorSlot }]; // might need revisiting
+        route = [{ path: 0x01, slot: this.parent.ProcessorSlot }]; // FAB Added Route interface
       }
     }
 
     let path = [];
     if (route) {
+      route.forEach((segment) => {
+        if (typeof segment.slot === "number") {
+          // port segment
+          path += segment;
+        } else {
+          // port segment with link
+          path.push(segment.path + 0x10);
+          path.push(segment.slot.length);
+
+          const chars = segment.slot.split("");
+          chars.forEach((char) => {
+            path.push(char.charCodeAt(0));
+          });
+
+          // byte align
+          if (path.length % 2) {
+            path.push(0x00);
+          }
+        }
+      });
     }
+
+    path.push([0x20, 0x02, 0x24, 0x01]);
+
+    const path_size = path.length / 2;
+    const pack_format = `<${path.length}B`;
+    const connection_path = struct.pack(pack_format, path);
+
+    return { path_size, connection_path };
   }
 }
