@@ -9,12 +9,7 @@ interface Route {
   slot: number | string;
 }
 
-// interface Context {
-//   index: number;
-//   code: number;
-// }
-
-class Connection {
+export class Connection {
   private parent: PLC;
   private port = 44818;
   private VendorID = 0x1337;
@@ -31,7 +26,7 @@ class Connection {
   private SerialNumber = 0;
   private OriginatorSerialNumber = 42;
   private SequenceCounter = 1;
-  private ConnectionSize: number | null = null; // Default to try Large, then Small Fwd Open.
+  public ConnectionSize: number | null = null; // Default to try Large, then Small Fwd Open.
 
   constructor(parent: PLC) {
     this.parent = parent;
