@@ -1,12 +1,18 @@
 import { Socket, isIPv4 } from "net";
 import { PLC } from "./eip";
 import { randrange } from "./utils/helperFunctions";
+import {Dictionary} from 'lodash'
 const struct = require("python-struct");
 
 interface Route {
   path: number;
   slot: number | string;
 }
+
+// interface Context {
+//   index: number;
+//   code: number;
+// }
 
 class Connection {
   private parent: PLC;
@@ -36,7 +42,19 @@ class Connection {
     return this._connect(connected, conn_class);
   }
 
-  // public send()
+  public send(request:Buffer, connected = true, slot=0){
+    // Send the request to the PLC, return the status and data
+    let eip_header:Buffer;
+    if(this._connected){
+      eip_header = this._buildEIPHeader(request)
+    } else {
+      const path = this._unconnectedPath(slot)
+      const buffArray = [this._buildCIPUnconnectedSend(request.length), request, path]
+      const frame = Buffer.concat(buffArray)
+      eip_header = this._buildEIPSendRRDataHeader(frame.length) + frame
+    }
+    return this._getBytes(eip_header, connected)
+  }
 
   public close() {
     this._closeConnection();
@@ -92,9 +110,50 @@ class Connection {
     }
   }
 
-  private _closeConnection() {}
+  private _closeConnection() {
+    // Close the connection to the PLC (forward close, unregister session)
+    this.SocketConnected = false
+    try {
+      if(this._connected){
+        const close_packet = this._buildForwardClosePacket()
+        this.Socket.write(close_packet)
+        const ret_data = this.recv_data()
+        this._connected = false
+      }
+      if(this._registered){
+        const unreg_packet = this._buildUnregisterSession()
+        this.Socket.write(unreg_packet)
+      }
+      this.Socket.destroy()
+    } catch (error) {
+      this.Socket.destroy()
+    }
+  }
 
-  private recv_data() {
+  private _getBytes(data:Buffer, connected:boolean){
+    // Sends data and gets the return data, optionally asserting data size limit
+    if(this.ConnectionSize != null && data.length > this.ConnectionSize){
+      throw `ethernet/ip _getBytes output size exceeded: ${data.length} bytes`
+    }
+    try {
+      this.Socket.write(data)
+      const ret_data = this.recv_data()
+      if(ret_data){
+        if(connected){
+          const status = struct.unpack_from('<B', ret_data, 48)[0]
+        } else {
+          const status = struct.unpack_from('<B', ret_data, 42)[0]
+        }
+        return { status, ret_data };
+      } else {
+        return { status: 1, ret_data: null };
+      }
+    } catch (error) {
+      
+    }
+  }
+
+  private recv_data():Buffer {
     /*
         When receiving data from the socket, it is possible to receive
         incomplete data.  The initial packet that comes in contains
@@ -103,11 +162,12 @@ class Connection {
         when using LargeForwardOpen
     */
 
-    let data = 0b0;
+    let data:Buffer;
     //let part = this.Socket.recv(4096);
     let part = this.Socket.read(4096);
     const payload_len = struct.unpack("<H", part, 2)[0];
-    data += part;
+    data = part;
+
 
     while (data.length - 24 < payload_len) {
       part = this.Socket.read(4096);
@@ -186,7 +246,7 @@ class Connection {
   private _buildForwardOpenPacket() {
     // Assemble the forward open packet
     const forwardOpen = this._buildCIPForwardOpen();
-    const rrDataHeader = this._buildEIPSendRRDataHeader(len(forwardOpen));
+    const rrDataHeader = this._buildEIPSendRRDataHeader(forwardOpen);
     return rrDataHeader + forwardOpen;
   }
 
@@ -266,7 +326,7 @@ class Connection {
     return ForwardOpen + connection_path;
   }
 
-  private _buildCIPUnconnectedSend() {
+  private _buildCIPUnconnectedSend(serviceSize:number):Buffer {
     // build unconnected send to request tag database
     const CIPService = 0x52;
     const CIPPathSize = 0x02;
@@ -276,7 +336,8 @@ class Connection {
     const CIPInstance = 0x01;
     const CIPPriority = 0x0a;
     const CIPTimeoutTicks = 0x0e;
-    const ServiceSize = 0x06;
+    // const ServiceSize = 0x06;
+    const ServiceSize = serviceSize;
 
     return struct.pack(
       "<BBBBBBBBH",
@@ -292,7 +353,7 @@ class Connection {
     );
   }
 
-  private _buildEIPHeader(ioi) {
+  private _buildEIPHeader(ioi: Buffer) {
     /*
      The EIP Header contains the tagIOI and the
      commands to perform the read or write.  This request
@@ -302,11 +363,11 @@ class Connection {
       this.ContextPointer = 0;
     }
 
-    const EIPPayloadLength = 22 + len(ioi);
-    const EIPConnectedDataLength = len(ioi) + 2;
+    const EIPPayloadLength = 22 + ioi.length;
+    const EIPConnectedDataLength = ioi.length + 2;
 
     const EIPCommand = 0x70;
-    const EIPLength = 22 + len(ioi);
+    const EIPLength = 22 + ioi.length;
     const EIPSessionHandle = this.SessionHandle;
     const EIPStatus = 0x00;
     const EIPContext = context_dict[this.ContextPointer];
@@ -347,7 +408,7 @@ class Connection {
     return EIPHeaderFrame + ioi;
   }
 
-  private _buildEIPSendRRDataHeader(frameLen) {
+  private _buildEIPSendRRDataHeader(frameLen:number) {
     // Build the EIP Send RR Data Header
     const EIPCommand = 0x6f;
     const EIPLength = 16 + frameLen;
@@ -462,7 +523,7 @@ class Connection {
 
   private _connectedPath() {
     // Build the connected path partition? of the packet
-    //if a route was provided, use it, otherwise use
+    // if a route was provided, use it, otherwise use
     // the default route
     let route: Array<Route> | null;
     if (this.parent.Route) {
@@ -507,9 +568,49 @@ class Connection {
 
     return { path_size, path: connection_path };
   }
+
+  private _unconnectedPath(slot: number):Buffer{
+    // Build the unconnection path portion of the packet
+    // if a route was provided, use it, otherwise use
+    // the default route
+    let route: Array<Route> | null;
+    if(this.parent.Route){
+      route = this.parent.Route;
+    } else{
+      route = [{ path: 0x01, slot: slot }];
+    }
+    const reserved = 0x00
+    let path: (number | Route)[] = []
+    route!.forEach((segment) => {
+      if (typeof segment.slot === "number") {
+        // port segment
+        path.push(segment);
+      } else {
+        // port segment with link
+        path.push(segment.path + 0x10);
+        path.push(segment.slot.length);
+
+        const chars = segment.slot.split("");
+        chars.forEach((char) => {
+          path.push(char.charCodeAt(0));
+        });
+
+        // byte align
+        if (path.length % 2) {
+          path.push(0x00);
+        }
+      }
+    });
+
+    const path_size = path.length / 2;
+    const pack_format = `<${path.length}BBB`;
+    const connection_path = struct.pack(pack_format, path_size, reserved, path);
+
+    return connection_path
+  }
 }
 
-const context_dict = {
+const context_dict:Dictionary<number> = {
   0: 0x6572276557,
   1: 0x6f6e,
   2: 0x676e61727473,
